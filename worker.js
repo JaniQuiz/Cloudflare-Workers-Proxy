@@ -9,25 +9,55 @@ async function handleRequest(request) {
       // 如果访问根目录，返回HTML
       if (url.pathname === "/") {
           return new Response(getRootHtml(), {
-              headers: {
-                  'Content-Type': 'text/html; charset=utf-8'
-              }
+              headers: { 'Content-Type': 'text/html; charset=utf-8' }
           });
       }
 
-      // 从请求路径中提取目标 URL
-      let actualUrlStr = decodeURIComponent(url.pathname.replace("/", ""));
+      // 1. 从请求路径中提取目标 URL，并修复丢失域名的前端 API 请求
+      let rawPath = decodeURIComponent(url.pathname.substring(1));
+      let actualUrlStr = rawPath;
 
-      // 判断用户输入的 URL 是否带有协议
-      actualUrlStr = ensureProtocol(actualUrlStr, url.protocol);
+      // 获取路径的第一段来判断是否是完整的域名
+      const firstSegment = rawPath.split('/')[0];
+      const isDomain = firstSegment.match(/^([a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}$/) || 
+                       firstSegment.match(/^\d{1,3}(\.\d{1,3}){3}$/) || 
+                       firstSegment.startsWith("localhost") || 
+                       rawPath.startsWith("http");
 
-      // 保留查询参数
+      if (!isDomain) {
+          // 如果不像域名（例如纯 /login），尝试从 Referer 恢复真正的目标站点
+          const referer = request.headers.get("Referer");
+          if (referer) {
+              try {
+                  const refererUrl = new URL(referer);
+                  let refererTarget = decodeURIComponent(refererUrl.pathname.substring(1));
+                  refererTarget = ensureProtocol(refererTarget, url.protocol);
+                  const targetOrigin = new URL(refererTarget).origin;
+                  actualUrlStr = targetOrigin + url.pathname;
+              } catch (e) {
+                  actualUrlStr = ensureProtocol(actualUrlStr, url.protocol);
+              }
+          } else {
+              actualUrlStr = ensureProtocol(actualUrlStr, url.protocol);
+          }
+      } else {
+          actualUrlStr = ensureProtocol(actualUrlStr, url.protocol);
+      }
+
       actualUrlStr += url.search;
 
-      // 创建新 Headers 对象，排除以 'cf-' 开头的请求头
+      // 2. 伪造请求头，防止目标服务器的防跨域 (CORS/CSRF) 拦截
       const newHeaders = filterHeaders(request.headers, name => !name.startsWith('cf-'));
+      try {
+          const targetUrlObj = new URL(actualUrlStr);
+          newHeaders.set('Host', targetUrlObj.host);
+          newHeaders.set('Origin', targetUrlObj.origin);
+          newHeaders.set('Referer', targetUrlObj.href);
+      } catch (e) {
+          // 解析失败时忽略
+      }
 
-      // 创建一个新的请求以访问目标 URL
+      // 创建一个新的请求
       const modifiedRequest = new Request(actualUrlStr, {
           headers: newHeaders,
           method: request.method,
@@ -35,38 +65,55 @@ async function handleRequest(request) {
           redirect: 'manual'
       });
 
-      // 发起对目标 URL 的请求
       const response = await fetch(modifiedRequest);
+      // ==========================================
+      // [新增] WebSocket 专属直通通道
+      // 如果请求头包含 Upgrade: websocket，或者响应状态码是 101
+      // 必须直接返回原始 response，交由底层接管 TCP 流，绝不能修改 body 或 headers
+      if (
+          request.headers.get("Upgrade")?.toLowerCase() === "websocket" || 
+          response.status === 101
+      ) {
+          return response;
+      }
+      // ==========================================
       let body = response.body;
 
       // 处理重定向
       if ([301, 302, 303, 307, 308].includes(response.status)) {
           body = response.body;
-          // 创建新的 Response 对象以修改 Location 头部
-          return handleRedirect(response, body);
+          // 传入 actualUrlStr 以修复目标站点返回相对路径重定向的问题
+          return handleRedirect(response, body, actualUrlStr);
       } else if (response.headers.get("Content-Type")?.includes("text/html")) {
           body = await handleHtmlContent(response, url.protocol, url.host, actualUrlStr);
       }
 
-      // 创建修改后的响应对象
-      const modifiedResponse = new Response(body, {
+      // 3. 修复 Cookie 的 Domain 限制，确保登录态可以保存在代理域名下
+      const responseHeaders = new Headers(response.headers);
+      if (responseHeaders.has("Set-Cookie")) {
+          // 兼容 Cloudflare Workers 的 getSetCookie 数组方法
+          const cookies = response.headers.getSetCookie ? response.headers.getSetCookie() : [responseHeaders.get("Set-Cookie")];
+          responseHeaders.delete("Set-Cookie");
+          for (let cookie of cookies) {
+              if (cookie) {
+                  // 移除 domain=xxx 属性，让浏览器默认将 Cookie 种在当前代理域名下
+                  let newCookie = cookie.replace(/domain=[^;]+;?/gi, '');
+                  responseHeaders.append("Set-Cookie", newCookie);
+              }
+          }
+      }
+
+      setNoCacheHeaders(responseHeaders);
+      setCorsHeaders(responseHeaders);
+
+      return new Response(body, {
           status: response.status,
           statusText: response.statusText,
-          headers: response.headers
+          headers: responseHeaders
       });
 
-      // 添加禁用缓存的头部
-      setNoCacheHeaders(modifiedResponse.headers);
-
-      // 添加 CORS 头部，允许跨域访问
-      setCorsHeaders(modifiedResponse.headers);
-
-      return modifiedResponse;
   } catch (error) {
-      // 如果请求目标地址时出现错误，返回带有错误消息的响应和状态码 500（服务器错误）
-      return jsonResponse({
-          error: error.message
-      }, 500);
+      return jsonResponse({ error: error.message }, 500);
   }
 }
 
@@ -76,26 +123,172 @@ function ensureProtocol(url, defaultProtocol) {
 }
 
 // 处理重定向
-function handleRedirect(response, body) {
-  const location = new URL(response.headers.get('location'));
-  const modifiedLocation = `/${encodeURIComponent(location.toString())}`;
-  return new Response(body, {
-      status: response.status,
-      statusText: response.statusText,
-      headers: {
-          ...response.headers,
-          'Location': modifiedLocation
-      }
-  });
+// 修复后的 handleRedirect：支持处理相对路径重定向（例如 Location: /dashboard）
+function handleRedirect(response, body, actualUrlStr) {
+  let locationStr = response.headers.get('location');
+  try {
+      // 如果 target 返回的是相对路径，需要结合实际目标 URL 获取绝对路径
+      const targetOrigin = new URL(actualUrlStr).origin;
+      const locationUrl = new URL(locationStr, targetOrigin);
+      const modifiedLocation = `/${encodeURIComponent(locationUrl.toString())}`;
+      
+      const newHeaders = new Headers(response.headers);
+      newHeaders.set('Location', modifiedLocation);
+
+      return new Response(body, {
+          status: response.status,
+          statusText: response.statusText,
+          headers: newHeaders
+      });
+  } catch (e) {
+      return new Response(body, {
+          status: response.status,
+          statusText: response.statusText,
+          headers: response.headers
+      });
+  }
 }
 
 // 处理 HTML 内容中的相对路径
+// 替换原有的 handleHtmlContent 方法
 async function handleHtmlContent(response, protocol, host, actualUrlStr) {
-  const originalText = await response.text();
-  const regex = new RegExp('((href|src|action)=["\'])/(?!/)', 'g');
-  let modifiedText = replaceRelativePaths(originalText, protocol, host, new URL(actualUrlStr).origin);
+    const originalText = await response.text();
+    const targetOrigin = new URL(actualUrlStr).origin;
+    
+    // 1. 基础的正则替换（保留你原有的逻辑，处理静态标签）
+    let modifiedText = replaceRelativePaths(originalText, protocol, host, targetOrigin);
 
-  return modifiedText;
+    // 2. 提取当前请求的目标域名（例如 github.com）
+    const targetHost = new URL(actualUrlStr).host;
+
+    // 3. 将拦截器脚本注入到 <head> 的最前面
+    const injectScript = getInjectScript(targetHost);
+    
+    // 尝试在 <head> 标签后注入，如果没有 <head>，则在最前面注入
+    if (modifiedText.includes('<head>')) {
+        modifiedText = modifiedText.replace('<head>', `<head>\n${injectScript}\n`);
+    } else if (modifiedText.includes('<head ')) {
+        modifiedText = modifiedText.replace(/(<head[^>]*>)/i, `$1\n${injectScript}\n`);
+    } else {
+        modifiedText = injectScript + modifiedText;
+    }
+
+    return modifiedText;
+}
+
+// 新增方法：生成需要注入的前端拦截器脚本
+// 生成需要注入的前端拦截器脚本（包含 WebSocket 支持）
+function getInjectScript(targetHost) {
+    return `
+    <script>
+    (function() {
+        const proxyOrigin = window.location.origin;
+        const targetHost = "${targetHost}";
+        const targetPrefix = proxyOrigin + '/' + targetHost;
+        
+        // 动态计算代理站点的 WebSocket 协议 (http -> ws, https -> wss)
+        const proxyWsOrigin = (window.location.protocol === 'https:' ? 'wss:' : 'ws:') + '//' + window.location.host;
+
+        // URL 重写核心逻辑 (升级支持 ws/wss)
+        function rewriteUrl(url) {
+            if (!url) return url;
+            let urlStr = String(url);
+            
+            if (urlStr.startsWith(proxyOrigin) || urlStr.startsWith(proxyWsOrigin)) return urlStr;
+            
+            // 拦截绝对路径
+            if (urlStr.startsWith('/') && !urlStr.startsWith('//')) {
+                return targetPrefix + urlStr;
+            }
+            
+            // 拦截 HTTP/HTTPS
+            if (urlStr.startsWith('http')) {
+                try {
+                    let u = new URL(urlStr);
+                    if (u.host === targetHost) {
+                        return targetPrefix + u.pathname + u.search + u.hash;
+                    }
+                    return proxyOrigin + '/' + u.host + u.pathname + u.search + u.hash;
+                } catch(e) { return urlStr; }
+            }
+
+            // 拦截 WS/WSS
+            if (urlStr.startsWith('ws://') || urlStr.startsWith('wss://')) {
+                try {
+                    let u = new URL(urlStr);
+                    // 强制将目标 WS 地址转换为通过代理域名的 WS 地址
+                    return proxyWsOrigin + '/' + u.host + u.pathname + u.search;
+                } catch(e) { return urlStr; }
+            }
+
+            return urlStr;
+        }
+
+        // 1. 劫持 fetch
+        const originalFetch = window.fetch;
+        window.fetch = async function(...args) {
+            let [resource, config] = args;
+            if (typeof resource === 'string' || resource instanceof URL) {
+                resource = rewriteUrl(resource);
+            } else if (resource instanceof Request) {
+                const newUrl = rewriteUrl(resource.url);
+                resource = new Request(newUrl, resource);
+            }
+            return originalFetch.call(this, resource, config);
+        };
+
+        // 2. 劫持 XMLHttpRequest
+        const originalOpen = XMLHttpRequest.prototype.open;
+        XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+            url = rewriteUrl(url);
+            return originalOpen.call(this, method, url, ...rest);
+        };
+
+        // 3. 劫持 History API
+        const originalPushState = history.pushState;
+        history.pushState = function(state, title, url) {
+            if (url) url = rewriteUrl(url);
+            return originalPushState.call(this, state, title, url);
+        };
+        const originalReplaceState = history.replaceState;
+        history.replaceState = function(state, title, url) {
+            if (url) url = rewriteUrl(url);
+            return originalReplaceState.call(this, state, title, url);
+        };
+
+        // 4. 劫持原生 window.open
+        const originalWindowOpen = window.open;
+        window.open = function(url, target, features) {
+            if (url) url = rewriteUrl(url);
+            return originalWindowOpen.call(this, url, target, features);
+        };
+
+        // 5. [终极覆盖] 劫持 WebSocket
+        const originalWebSocket = window.WebSocket;
+        window.WebSocket = function(url, protocols) {
+            // 重写传入的 WS URL
+            let rewrittenUrl = rewriteUrl(url);
+            
+            // 实例化原生 WebSocket
+            let wsInstance;
+            if (protocols) {
+                wsInstance = new originalWebSocket(rewrittenUrl, protocols);
+            } else {
+                wsInstance = new originalWebSocket(rewrittenUrl);
+            }
+            return wsInstance;
+        };
+        // 继承原生 WebSocket 的静态属性和原型，防止某些库的类型校验失败
+        window.WebSocket.prototype = originalWebSocket.prototype;
+        window.WebSocket.CONNECTING = originalWebSocket.CONNECTING;
+        window.WebSocket.OPEN = originalWebSocket.OPEN;
+        window.WebSocket.CLOSING = originalWebSocket.CLOSING;
+        window.WebSocket.CLOSED = originalWebSocket.CLOSED;
+
+        console.log("[CF Proxy] Ultimate Interceptors (inc. WebSocket) Injected for:", targetHost);
+    })();
+    </script>
+    `;
 }
 
 // 替换 HTML 内容中的相对路径
